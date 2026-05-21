@@ -1,3 +1,34 @@
+//! Inbound `Gossip` gRPC service.
+//!
+//! Implements the proto-defined `Gossip` service (see
+//! `proto/gossip.proto`). For each accepted connection this file
+//! handles both RPCs:
+//!
+//! - **`PingServer` (unary)**: SWIM-style ping with optional embedded
+//!   `state_sync` and `ping_req` indirect-probe forwarding. Used by
+//!   the membership channel; no streaming, no per-call task state.
+//! - **`SyncStream` (bidirectional streaming)**: spawns **two tasks**
+//!   per accepted stream that share a few small pieces of state:
+//!   - **Inbound-handler task** — reads frames the dialer sends.
+//!     The first non-empty `msg.peer_id` is written into
+//!     `learned_peer: Arc<RwLock<Option<String>>>`. Dispatches
+//!     received `StreamBatch` payloads into local `MeshKV` via
+//!     [`dispatch_stream_batch`](crate::transport::sync_stream::dispatch_stream_batch).
+//!     Idle-timeout wraps `incoming.next()` so unhealthy peers don't
+//!     pin the task indefinitely.
+//!   - **Inbound-sender task** — every 1 Hz, reads the shared
+//!     [`RoundBatch`](crate::kv::RoundBatch) slot produced by
+//!     [`gossip_controller`](crate::gossip_controller)'s event loop,
+//!     filters targeted entries for the learned peer, and emits
+//!     `StreamBatch` envelopes on this stream.
+//!
+//! Asymmetry with the outbound side: the dialer (gossip_controller)
+//! knows its counterparty by name at task-spawn time. The acceptor
+//! here does not — the only way to associate the in-flight TCP/gRPC
+//! connection with a logical mesh identity (today, pre-mTLS-derived
+//! identity) is to read the first inbound frame's `peer_id`. That
+//! learning step is what `learned_peer` exists for.
+
 use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::Result;
@@ -25,14 +56,21 @@ use super::{
         try_ping, ClusterState,
     },
     transport::{
-        chunking::{build_stream_batches, chunk_value, dispatch_stream_batch, next_generation},
-        limits::{
-            DEFAULT_MAX_CHUNKS_PER_BATCH, MAX_MESSAGE_SIZE, MAX_STREAM_CHUNK_BYTES,
-            STREAM_IDLE_TIMEOUT,
+        limits::{MAX_MESSAGE_SIZE, STREAM_IDLE_TIMEOUT},
+        sync_stream::{
+            build_heartbeat, build_peer_stream_batches, dispatch_stream_batch, wrap_stream_batch,
         },
     },
 };
 
+/// Server-side handler for the proto-defined `Gossip` service.
+///
+/// One instance per mesh node. Configured at startup by
+/// `service.rs::MeshServerBuilder` and registered with tonic. Holds
+/// shared references to the cluster state, mTLS config, partition
+/// detector, the per-node `RoundBatch` slot owned by the controller,
+/// and the node's `MeshKV`. See module docs for the per-accepted-
+/// stream task topology spawned by `sync_stream`.
 #[derive(Debug)]
 pub struct GossipService {
     state: ClusterState,
@@ -250,51 +288,16 @@ impl Gossip for GossipService {
                     }
                     last_stream_batch = Some(stream_batch.clone());
 
-                    let peer_for_targeted = learned_peer_sender.read().clone();
-                    let has_targeted = peer_for_targeted.as_ref().is_some_and(|p| {
-                        stream_batch.targeted_entries.iter().any(|(t, _, _)| t == p)
-                    });
-                    if stream_batch.drain_entries.is_empty() && !has_targeted {
-                        continue;
-                    }
-
-                    let mut entries = Vec::new();
-                    for (key, value) in &stream_batch.drain_entries {
-                        entries.extend(chunk_value(
-                            key.clone(),
-                            next_generation(),
-                            value.clone(),
-                            MAX_STREAM_CHUNK_BYTES,
-                        ));
-                    }
-                    if let Some(ref peer) = peer_for_targeted {
-                        for (target, key, value) in &stream_batch.targeted_entries {
-                            if target == peer {
-                                entries.extend(chunk_value(
-                                    key.clone(),
-                                    next_generation(),
-                                    value.clone(),
-                                    MAX_STREAM_CHUNK_BYTES,
-                                ));
-                            }
-                        }
-                    }
-                    if entries.is_empty() {
-                        continue;
-                    }
-
-                    for batch in build_stream_batches(
-                        entries,
-                        DEFAULT_MAX_CHUNKS_PER_BATCH,
-                        MAX_STREAM_CHUNK_BYTES,
-                    ) {
+                    // `peer_id = ""` => peer not yet learned; drain still
+                    // emits, targeted skipped. Hold the guard across the
+                    // sync helper call to avoid a per-tick String alloc.
+                    let batches = {
+                        let guard = learned_peer_sender.read();
+                        build_peer_stream_batches(&stream_batch, guard.as_deref().unwrap_or(""))
+                    };
+                    for batch in batches {
                         sequence_counter += 1;
-                        let msg = StreamMessage {
-                            message_type: StreamMessageType::StreamBatch as i32,
-                            payload: Some(gossip::stream_message::Payload::StreamBatch(batch)),
-                            sequence: sequence_counter,
-                            peer_id: self_name_sender.clone(),
-                        };
+                        let msg = wrap_stream_batch(batch, sequence_counter, &self_name_sender);
                         match tx_sender.try_send(Ok(msg)) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -363,12 +366,7 @@ impl Gossip for GossipService {
 
                 match msg.message_type() {
                     StreamMessageType::Heartbeat => {
-                        let heartbeat = StreamMessage {
-                            message_type: StreamMessageType::Heartbeat as i32,
-                            payload: None,
-                            sequence,
-                            peer_id: self_name.clone(),
-                        };
+                        let heartbeat = build_heartbeat(sequence, &self_name);
                         if tx.send(Ok(heartbeat)).await.is_err() {
                             break;
                         }
