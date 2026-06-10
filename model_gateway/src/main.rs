@@ -4,10 +4,10 @@ use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rand::{distr::Alphanumeric, Rng};
 use smg::{
     config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, SchemaConfig,
-        TokenizerCacheConfig, TraceConfig,
+        validate_mesh_server_name, CircuitBreakerConfig, ConfigError, ConfigResult,
+        DiscoveryConfig, HealthCheckConfig, HistoryBackend, ManualAssignmentMode, MetricsConfig,
+        OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig,
+        RoutingMode, SchemaConfig, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -861,6 +861,7 @@ impl CliArgs {
         }
 
         let self_name = if let Some(name) = &self.mesh_server_name {
+            validate_mesh_server_name(name)?;
             name.to_string()
         } else {
             let mut rng = rand::rng();
